@@ -48,6 +48,8 @@ from utils.demo_utils import (
     images_to_video,
 )
 
+import json
+
 MIN_NUM_FRAMES = 1
 
 
@@ -151,6 +153,32 @@ def run_image_demo(args):
 
     print(f'Saved the result image to {output_path}.')
 
+def get_camera_parameters(pred_cam, bbox):
+    FOCAL_LENGTH = constants.FOCAL_LENGTH
+    CROP_SIZE = 224
+
+    bbox_cx, bbox_cy, bbox_w, bbox_h = bbox
+    assert bbox_w == bbox_h
+
+    bbox_size = bbox_w
+    bbox_x = bbox_cx - bbox_w / 2.
+    bbox_y = bbox_cy - bbox_h / 2.
+
+    scale = bbox_size / CROP_SIZE
+
+    cam_intrinsics = np.eye(3)
+    cam_intrinsics[0, 0] = FOCAL_LENGTH * scale
+    cam_intrinsics[1, 1] = FOCAL_LENGTH * scale
+    cam_intrinsics[0, 2] = bbox_size / 2. + bbox_x 
+    cam_intrinsics[1, 2] = bbox_size / 2. + bbox_y
+
+    cam_s, cam_tx, cam_ty = pred_cam
+    trans = [cam_tx, cam_ty, 2*FOCAL_LENGTH/(CROP_SIZE*cam_s + 1e-9)]
+
+    cam_extrinsics = np.eye(4)
+    cam_extrinsics[:3, 3] = trans
+
+    return cam_intrinsics.tolist(), cam_extrinsics.tolist()
 
 def run_video_demo(args):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -322,6 +350,9 @@ def run_video_demo(args):
 
                 pred_cam, pred_verts, pred_pose, pred_betas, pred_joints3d, norm_joints2d = [], [], [], [], [], []
 
+                # create dict to store humannerf format
+                data_json = {}
+
                 for batch in dataloader:
                     if has_keypoints:
                         batch, nj2d = batch
@@ -353,6 +384,7 @@ def run_video_demo(args):
                 pred_betas = torch.cat(pred_betas, dim=0)
                 pred_joints3d = torch.cat(pred_joints3d, dim=0)
 
+
                 del batch
 
             # ========= Save results to a pickle file ========= #
@@ -383,6 +415,32 @@ def run_video_demo(args):
 
             pred_results[person_id] = output_dict
 
+            # save results to humannerf format
+
+            for idx in tqdm(range(1, 1+pred_cam.shape[0])):
+                # cam_intrinsics = [[constants.FOCAL_LENGTH, 0.0, orig_width/2],
+                #                             [0.0, constants.FOCAL_LENGTH, orig_height/2],
+                #                             [0.0, 0.0, 1.0]]
+                # cam_extrinsics = [[1.0, 0.0, 0.0, pred_cam[idx,1].item()],
+                #                             [0.0, 1.0, 0.0, pred_cam[idx,2].item()],
+                #                             [0.0, 0.0,  1.0, (2*constants.FOCAL_LENGTH/(constants.IMG_RES * pred_cam[idx,0] +1e-9)).item()],
+                #                             [0.0, 0.0, 0.0, 1.0]]
+
+                cam_intrinsics, cam_extrinsics = get_camera_parameters(pred_cam[idx-1], bboxes[idx-1])
+                frame_data = {
+                    'poses': pred_pose[idx-1].astype(float).tolist(),
+                    'betas': pred_betas[idx-1].astype(float).tolist(),
+                    'cam_intrinsics': cam_intrinsics,
+                    'cam_extrinsics': cam_extrinsics
+                }
+
+                data_json['%06d'%idx] = frame_data
+
+            json_file_path = os.path.join(output_path, '%d_metadata.json'%person_id)
+            with open(json_file_path, "w") as jsonfile:
+                json.dump(data_json, jsonfile)
+            
+
         del model
 
         end = time.time()
@@ -402,7 +460,9 @@ def run_video_demo(args):
         renderer = PyRenderer(resolution=(orig_width, orig_height))
 
         output_img_folder = os.path.join(output_path, osp.split(image_folder)[-1] + '_output')
+        output_raw_img_folder = os.path.join(output_path, osp.split(image_folder)[-1] + '_input')
         os.makedirs(output_img_folder, exist_ok=True)
+        os.makedirs(output_raw_img_folder, exist_ok=True)
 
         print(f'Rendering output video, writing frames to {output_img_folder}')
 
@@ -478,7 +538,8 @@ def run_video_demo(args):
                     )
 
             if args.with_raw:
-                img = np.concatenate([raw_img, img], axis=1)
+                # img = np.concatenate([raw_img, img], axis=1)
+                imsave(os.path.join(output_raw_img_folder, osp.split(img_fname)[-1][:-4]+'.png'), raw_img)
 
             if args.empty_bg:
                 img = np.concatenate([img, empty_img], axis=1)
